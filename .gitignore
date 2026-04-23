@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Scraper state
+*.db
+
+# Env
+.env
+.env.*
+
+# Node
+node_modules/
+.next/
+dist/
+
+# OS
+.DS_Store
+
+# Training artifacts
+models/
+*.bin
+*.safetensors
