@@ -1,0 +1,227 @@
+"""
+CNN politics article scraper — parallel async version.
+
+URL discovery uses CNN's public monthly sitemaps (no browser needed):
+  https://www.cnn.com/sitemap/article/politics/YYYY/MM.xml
+
+N async workers each hold their own browser page and pull from a shared queue.
+Default 4 workers cuts estimated runtime from ~3.5 days to ~20 hours.
+
+Usage:
+    python cnn_scraper.py                        # full run, 4 workers
+    python cnn_scraper.py --workers 6            # more parallelism
+    python cnn_scraper.py --target 25000         # stop after 25k articles
+    python cnn_scraper.py --limit 50             # small test run
+
+Output: data/raw/cnn.jsonl
+Schema: {source, url, date, title, text, politicians}
+"""
+
+import argparse
+import asyncio
+import sys
+from itertools import product
+from pathlib import Path
+
+import httpx
+from bs4 import BeautifulSoup
+from playwright.async_api import Page, async_playwright
+
+sys.path.insert(0, str(Path(__file__).parent))
+from utils import (
+    count_saved,
+    mentions_politician,
+    setup_db,
+)
+
+RAW_DIR = Path(__file__).parent.parent / "raw"
+JSONL_PATH = str(RAW_DIR / "cnn.jsonl")
+DB_PATH = str(RAW_DIR / "cnn_seen.db")
+
+SITEMAP_URL = "https://www.cnn.com/sitemap/article/politics/{year}/{month:02d}.xml"
+SCRAPE_YEARS = range(2015, 2025)
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+# ── URL discovery (sync, no browser) ──────────────────────────────────────────
+
+def collect_urls_from_sitemaps() -> list[str]:
+    all_urls = []
+    for year, month in product(SCRAPE_YEARS, range(1, 13)):
+        url = SITEMAP_URL.format(year=year, month=month)
+        try:
+            r = httpx.get(url, timeout=15, follow_redirects=True)
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "xml")
+            locs = [u.find("loc").text for u in soup.find_all("url") if u.find("loc")]
+            articles = [l for l in locs if "/video/" not in l and "/gallery/" not in l]
+            all_urls.extend(articles)
+            print(f"  {year}/{month:02d}: {len(articles)} articles")
+        except Exception as e:
+            print(f"  {year}/{month:02d}: error — {e}")
+    return all_urls
+
+
+# ── Article scraping ───────────────────────────────────────────────────────────
+
+async def scrape_article(page: Page, url: str) -> dict | None:
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        html = await page.content()
+    except Exception as e:
+        print(f"  [skip] {url[-60:]} — {e}")
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    title_el = soup.find("h1")
+    if not title_el:
+        return None
+    title = title_el.get_text(strip=True)
+
+    date = ""
+    meta_date = soup.find("meta", {"property": "article:published_time"})
+    if meta_date and meta_date.get("content"):
+        date = meta_date["content"][:10]
+    else:
+        ts = soup.find(class_=lambda c: c and "timestamp" in c.lower())
+        if ts:
+            date = ts.get_text(strip=True)
+
+    content_el = (
+        soup.find("article")
+        or soup.find("div", class_=lambda c: c and "article__content" in c)
+        or soup.find("div", class_=lambda c: c and "body-text" in c)
+        or soup.find("section", class_=lambda c: c and "zn-body" in c)
+    )
+    if not content_el:
+        return None
+
+    paragraphs = [p.get_text(strip=True) for p in content_el.find_all("p") if p.get_text(strip=True)]
+    text = "\n".join(paragraphs)
+
+    if len(text.split()) < 100:
+        return None
+
+    politicians = mentions_politician(title + " " + text)
+    if not politicians:
+        return None
+
+    return {"source": "cnn", "url": url, "date": date, "title": title, "text": text, "politicians": politicians}
+
+
+# ── Parallel worker ────────────────────────────────────────────────────────────
+
+async def worker(
+    worker_id: int,
+    queue: asyncio.Queue,
+    page: Page,
+    write_lock: asyncio.Lock,
+    db_lock: asyncio.Lock,
+    conn,
+    target: int | None,
+    stop_event: asyncio.Event,
+) -> None:
+    import json, random, time
+
+    while not stop_event.is_set():
+        try:
+            url = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+        # Check target under lock
+        async with write_lock:
+            if target and count_saved(JSONL_PATH) >= target:
+                stop_event.set()
+                queue.task_done()
+                break
+
+        # Mark seen in DB
+        async with db_lock:
+            conn.execute(
+                "INSERT OR IGNORE INTO seen_urls (url, scraped_at) VALUES (?, ?)",
+                (url, time.time()),
+            )
+            conn.commit()
+
+        article = await scrape_article(page, url)
+
+        if article:
+            async with write_lock:
+                with open(JSONL_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(article, ensure_ascii=False) + "\n")
+                n = count_saved(JSONL_PATH)
+                print(f"  [w{worker_id}] #{n} — {article['title'][:55]}")
+                if target and n >= target:
+                    stop_event.set()
+
+        await asyncio.sleep(random.uniform(1.0, 2.5))
+        queue.task_done()
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+async def run(limit: int | None, target: int | None, workers: int) -> None:
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    conn = setup_db(DB_PATH)
+
+    print(f"Starting CNN scrape. Already saved: {count_saved(JSONL_PATH)} articles.")
+    print("\nCollecting URLs from sitemaps (2015–2024)...")
+    all_urls = list(set(collect_urls_from_sitemaps()))
+    print(f"\nTotal unique candidate URLs: {len(all_urls)}")
+
+    # Load seen URLs into memory for fast pre-filtering
+    seen = set(
+        row[0] for row in conn.execute("SELECT url FROM seen_urls").fetchall()
+    )
+    pending = [u for u in sorted(all_urls) if u not in seen]
+
+    if limit:
+        pending = pending[:limit]
+
+    print(f"URLs to scrape (excluding already seen): {len(pending)}")
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for url in pending:
+        await queue.put(url)
+
+    write_lock = asyncio.Lock()
+    db_lock = asyncio.Lock()
+    stop_event = asyncio.Event()
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        pages = [
+            await (await browser.new_context(user_agent=USER_AGENT)).new_page()
+            for _ in range(workers)
+        ]
+
+        print(f"\nScraping with {workers} parallel workers...\n")
+        await asyncio.gather(*[
+            worker(i + 1, queue, pages[i], write_lock, db_lock, conn, target, stop_event)
+            for i in range(workers)
+        ])
+
+        await browser.close()
+
+    conn.close()
+    print(f"\nDone. Total saved: {count_saved(JSONL_PATH)}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="CNN politics article scraper (parallel)")
+    parser.add_argument("--workers", type=int, default=4, help="Number of parallel browser pages (default: 4)")
+    parser.add_argument("--target", type=int, default=None, help="Stop after saving this many articles")
+    parser.add_argument("--limit", type=int, default=None, help="Cap URLs to attempt (for testing)")
+    args = parser.parse_args()
+    asyncio.run(run(limit=args.limit, target=args.target, workers=args.workers))
+
+
+if __name__ == "__main__":
+    main()
