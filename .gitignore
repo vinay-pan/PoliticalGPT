@@ -10,6 +10,9 @@ build/
 # Scraper state
 *.db
 
+# Raw scraped data (copyrighted — regenerate via scrapers)
+data/raw/*.jsonl
+
 # Env
 .env
 .env.*
