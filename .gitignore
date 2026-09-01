@@ -28,7 +28,15 @@ dist/
 # OS
 .DS_Store
 
+# Test artifacts
+.pytest_cache/
+
 # Training artifacts
 models/
 *.bin
 *.safetensors
+
+# GSD planning docs and internal project instructions (kept local-only)
+.planning/
+CLAUDE.md
+PLAN.md
