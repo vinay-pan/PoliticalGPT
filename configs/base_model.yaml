@@ -1,0 +1,26 @@
+# Shared base-model, quantization, and LoRA contract.
+# Consumed by: Phase 4 trainer (both CNN and Fox adapters), Phase 2/5 dial loader.
+# Asymmetric pins between the two adapters silently invalidate the interpolation
+# math (dial assumes both adapters share the exact same frozen W0).
+
+base_model:
+  repo_id: meta-llama/Llama-3.1-8B-Instruct
+  revision: "0e9e39f249a16976918f6564b8830bc894c89659"
+  dtype: bfloat16
+
+quantization:
+  # TRAINING ONLY — never use 4-bit quantization for serving/measurement,
+  # it introduces noise into the framing-divergence measurements.
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_compute_dtype: bfloat16
+
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  bias: none
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  use_rslora: false  # explicit — see STACK.md "What NOT to Use"
+  task_type: CAUSAL_LM
