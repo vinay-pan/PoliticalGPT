@@ -1,0 +1,53 @@
+# Mad-libs slot grammar for counterfactual event prompts.
+# Five slot dimensions per D-02: politician x event_type x setting x policy_area x outcome.
+# policy_area is a required slot per D-01 (real policy content, not generic filler).
+# No per-(politician, event_type) restriction map — D-04 requires every combination legal.
+
+politicians:
+  - id: trump
+    display_name: "Donald Trump"
+  - id: biden
+    display_name: "Joe Biden"
+  - id: obama
+    display_name: "Barack Obama"
+  - id: clinton
+    display_name: "Hillary Clinton"
+  - id: harris
+    display_name: "Kamala Harris"
+
+event_types:
+  - id: policy_announcement
+    template: "{politician} announces {policy_area} initiative"
+  - id: scandal_controversy
+    template: "{politician} faces controversy over {policy_area} matter"
+  - id: diplomatic_incident
+    template: "{politician} involved in diplomatic incident concerning {policy_area}"
+  - id: personnel_appointment
+    template: "{politician} appoints new official for {policy_area}"
+  - id: economic_action
+    template: "{politician} takes economic action on {policy_area}"
+  - id: legislative_vote
+    template: "{politician} pushes for a vote on {policy_area} legislation"
+
+policy_areas:
+  - healthcare
+  - immigration
+  - trade
+  - climate_energy
+  - education
+  - criminal_justice
+
+settings:
+  - "a press conference"
+  - "a campaign rally"
+  - "a closed-door meeting"
+  - "a televised interview"
+  - "a state visit"
+
+outcomes:
+  - passed
+  - blocked
+  - sparked_backlash
+  - won_bipartisan_praise
+  - stalled_in_committee
+  - ended_in_resignation
