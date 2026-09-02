@@ -152,6 +152,35 @@ exhaustively triaged. The open item (retry MFC sweep with a registered API key
 or longer cooldown before any external write-up) is carried forward in
 `RELATED_WORK.md` itself, not just here.
 
+## Decision Checkpoint: Correction — arXiv:2503.02080 full read
+
+**2026-09-02.** The "Prior-art sweep outcome" entry above, logged 2026-09-01,
+claimed "2 full paper reads" for the prior-art sweep. Independent verification
+(this project's phase-verifier, run against the actual committed files rather
+than trusting the plan summaries) found that claim was an overclaim: the
+2026-09-01 read of arXiv:2503.02080 was actually abstract-plus-metadata only —
+its PDF fetch had failed that day — and the shortfall was masked at the summary
+level in both `RELATED_WORK.md` and the entry above, exactly the failure mode
+01-RESEARCH.md's own Pitfall 1 warns against (treating a single-pass claim as
+settled without verification).
+
+The PDF was confirmed reachable today (`curl -sI` returned HTTP 200 — **not** a
+persistent block like the Media Frames Corpus 429) and was read in full via
+direct download **rather than** a tool-mediated fetch, surfacing genuine
+methodological detail not previously captured: specific attention-head indices
+(e.g. layer 15/head 18 in Llama-2-7b-chat), the exact cross-validated
+correlation values (ρ up to 0.861 for lawmaker ideology, up to 0.798 for
+outlet-slant transfer), the inference-time steering equation, and a
+layer-localization robustness finding (steering effective in layers <22,
+ineffective in layers ≥22). `RELATED_WORK.md`'s entry for this paper has been
+rewritten with this detail; **"2 full paper reads" is now an accurate claim**,
+not an overclaim, and the standing novelty verdict's MEDIUM-HIGH confidence now
+rests solely on the still-unresolved MFC sweep gap, not on any residual
+abstract-only read.
+
+Per this file's own append-only convention, the original 2026-09-01 entry above
+is left unedited; this entry is the correction, not a silent amendment.
+
 ## Decision Checkpoint: Release policy
 
 **2026-09-01.** **D-08:** This project stays private/research-only for now — no
