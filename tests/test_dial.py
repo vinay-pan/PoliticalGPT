@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import unittest
 from pathlib import Path
@@ -100,6 +101,90 @@ class DialCorrectnessTests(unittest.TestCase):
             self.assertTrue(torch.allclose(layer.get_delta_weight("fox"), self.pristine_deltas["fox"][layer]))
             self.assertEqual(layer.scaling["cnn"], 0.0)
             self.assertEqual(layer.scaling["fox"], self.base_scaling["fox"][layer])
+
+
+class SerializedGenerationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        torch.manual_seed(7)
+        config = LlamaConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=128,
+        )
+        lora_config = LoraConfig(
+            r=4,
+            lora_alpha=8,
+            lora_dropout=0.0,
+            bias="none",
+            target_modules=list(TARGET_MODULES),
+            task_type=TaskType.CAUSAL_LM,
+            use_rslora=False,
+        )
+        self.model = get_peft_model(LlamaForCausalLM(config), lora_config, adapter_name="cnn")
+        self.model.add_adapter("fox", lora_config)
+        self.model.base_model.set_adapter(list(ADAPTERS))
+        self.model.eval()
+        self.layers = tuple(module for module in self.model.modules() if isinstance(module, LoraLayer))
+
+        with torch.no_grad():
+            for layer_index, layer in enumerate(self.layers, start=1):
+                for adapter_index, adapter in enumerate(ADAPTERS, start=1):
+                    layer.lora_A[adapter].weight.fill_(0.01 * (layer_index + adapter_index))
+                    layer.lora_B[adapter].weight.fill_(0.02 * (layer_index + adapter_index))
+
+        self.base_scaling = MappingProxyType({
+            adapter: MappingProxyType({layer: layer.scaling[adapter] for layer in self.layers})
+            for adapter in ADAPTERS
+        })
+
+    async def test_overlapping_endpoint_calls_serialize_scales_and_model_outputs(self):
+        self.assertTrue(hasattr(blend, "generate_serialized"))
+
+        lock = asyncio.Lock()
+        first_snapshot = asyncio.Event()
+        critical_sections = []
+        traces = {"fox": [], "cnn": []}
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+
+        async def generate_callback(label):
+            critical_sections.append(("enter", label))
+            for snapshot_index in range(3):
+                scales = {
+                    adapter: tuple(layer.scaling[adapter] for layer in self.layers)
+                    for adapter in ADAPTERS
+                }
+                with torch.no_grad():
+                    logits = self.model(input_ids=input_ids).logits.detach().clone()
+                traces[label].append((scales, logits))
+                if label == "fox" and snapshot_index == 0:
+                    first_snapshot.set()
+                await asyncio.sleep(0)
+            critical_sections.append(("exit", label))
+
+        fox_task = asyncio.create_task(
+            blend.generate_serialized(self.model, 0.0, self.base_scaling, lock, lambda: generate_callback("fox"))
+        )
+        await first_snapshot.wait()
+        cnn_task = asyncio.create_task(
+            blend.generate_serialized(self.model, 1.0, self.base_scaling, lock, lambda: generate_callback("cnn"))
+        )
+        await asyncio.gather(fox_task, cnn_task)
+
+        self.assertEqual(
+            critical_sections,
+            [("enter", "fox"), ("exit", "fox"), ("enter", "cnn"), ("exit", "cnn")],
+        )
+        for label, expected_factors in (("fox", {"cnn": 0.0, "fox": 1.0}), ("cnn", {"cnn": 1.0, "fox": 0.0})):
+            self.assertEqual(len(traces[label]), 3)
+            for scales, logits in traces[label]:
+                for adapter, factor in expected_factors.items():
+                    expected_scales = tuple(self.base_scaling[adapter][layer] * factor for layer in self.layers)
+                    self.assertEqual(scales[adapter], expected_scales)
+                self.assertTrue(torch.allclose(logits, traces[label][0][1]))
+        self.assertFalse(torch.allclose(traces["fox"][0][1], traces["cnn"][0][1]))
 
 
 if __name__ == "__main__":
