@@ -38,5 +38,6 @@ models/
 
 # GSD planning docs and internal project instructions (kept local-only)
 .planning/
+.gsd/
 CLAUDE.md
 PLAN.md
