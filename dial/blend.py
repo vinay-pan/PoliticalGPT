@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
-from collections.abc import Mapping
-from typing import Any, TypeAlias
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, TypeAlias, TypeVar
 
 from peft.tuners.lora import LoraLayer
 
 
 AdapterName: TypeAlias = str
 BaseScaling: TypeAlias = Mapping[AdapterName, Mapping[LoraLayer, float]]
+GenerationResult = TypeVar("GenerationResult")
 
 
 def weights(lambda_value: float) -> dict[str, float]:
@@ -41,3 +43,16 @@ def set_lambda(model: Any, lambda_value: float, base_scaling: BaseScaling) -> No
                 raise AssertionError(f"captured base scale for {adapter!r} does not match PEFT configuration")
         layer.set_scale("cnn", requested_weights["cnn"])
         layer.set_scale("fox", requested_weights["fox"])
+
+
+async def generate_serialized(
+    model: Any,
+    lambda_value: float,
+    base_scaling: BaseScaling,
+    lock: asyncio.Lock,
+    generate_callback: Callable[[], Awaitable[GenerationResult]],
+) -> GenerationResult:
+    """Mutate shared adapter scales and await generation in one critical section."""
+    async with lock:
+        set_lambda(model, lambda_value, base_scaling)
+        return await generate_callback()
