@@ -1,4 +1,5 @@
 import asyncio
+import random
 import sys
 import unittest
 from pathlib import Path
@@ -26,6 +27,7 @@ TARGET_MODULES = (
     "down_proj",
 )
 ADAPTERS = ("cnn", "fox")
+LAMBDA_GRID = [-0.5, 0, 0.25, 0.5, 0.75, 1, 1.5]
 
 
 class DialApiContractTests(unittest.TestCase):
@@ -36,8 +38,10 @@ class DialApiContractTests(unittest.TestCase):
 
 @unittest.skipIf(blend is None, "dial implementation has not been created yet")
 class DialCorrectnessTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
+    def setUp(self):
+        self._reset_fixture()
+
+    def _reset_fixture(self):
         torch.manual_seed(7)
         config = LlamaConfig(
             hidden_size=64,
@@ -56,27 +60,39 @@ class DialCorrectnessTests(unittest.TestCase):
             task_type=TaskType.CAUSAL_LM,
             use_rslora=False,
         )
-        cls.model = get_peft_model(LlamaForCausalLM(config), lora_config, adapter_name="cnn")
-        cls.model.add_adapter("fox", lora_config)
-        cls.model.base_model.set_adapter(list(ADAPTERS))
-        cls.layers = tuple(module for module in cls.model.modules() if isinstance(module, LoraLayer))
+        self.model = get_peft_model(LlamaForCausalLM(config), lora_config, adapter_name="cnn")
+        self.model.add_adapter("fox", lora_config)
+        self.model.base_model.set_adapter(list(ADAPTERS))
+        self.layers = tuple(module for module in self.model.modules() if isinstance(module, LoraLayer))
 
         with torch.no_grad():
-            for layer_index, layer in enumerate(cls.layers, start=1):
+            for layer_index, layer in enumerate(self.layers, start=1):
                 for adapter_index, adapter in enumerate(ADAPTERS, start=1):
                     a_value = 0.01 * (layer_index + adapter_index)
                     b_value = 0.02 * (layer_index + adapter_index)
                     layer.lora_A[adapter].weight.fill_(a_value)
                     layer.lora_B[adapter].weight.fill_(b_value)
 
-        cls.base_scaling = MappingProxyType({
-            adapter: MappingProxyType({layer: layer.scaling[adapter] for layer in cls.layers})
+        self.base_scaling = MappingProxyType({
+            adapter: MappingProxyType({layer: layer.scaling[adapter] for layer in self.layers})
             for adapter in ADAPTERS
         })
-        cls.pristine_deltas = {
-            adapter: {layer: layer.get_delta_weight(adapter).detach().clone() for layer in cls.layers}
+        self.pristine_deltas = {
+            adapter: {layer: layer.get_delta_weight(adapter).detach().clone() for layer in self.layers}
             for adapter in ADAPTERS
         }
+
+    def _assert_live_formula_and_scales(self, lambda_value):
+        expected_factors = blend.weights(lambda_value)
+        for layer in self.layers:
+            expected_delta = (
+                lambda_value * self.pristine_deltas["cnn"][layer]
+                + (1.0 - lambda_value) * self.pristine_deltas["fox"][layer]
+            )
+            live_delta = layer.get_delta_weight("cnn") + layer.get_delta_weight("fox")
+            self.assertTrue(torch.allclose(live_delta, expected_delta, atol=1e-5))
+            for adapter, factor in expected_factors.items():
+                self.assertEqual(layer.scaling[adapter], self.base_scaling[adapter][layer] * factor)
 
     def test_fixture_activates_exact_adapter_pair_and_nonzero_deltas(self):
         self.assertEqual(set(self.layers[0].active_adapters), set(ADAPTERS))
@@ -101,6 +117,37 @@ class DialCorrectnessTests(unittest.TestCase):
             self.assertTrue(torch.allclose(layer.get_delta_weight("fox"), self.pristine_deltas["fox"][layer]))
             self.assertEqual(layer.scaling["cnn"], 0.0)
             self.assertEqual(layer.scaling["fox"], self.base_scaling["fox"][layer])
+
+    def test_exact_grid_matches_direct_formula_and_fresh_cat_oracle(self):
+        for grid_index, lambda_value in enumerate(LAMBDA_GRID):
+            self._reset_fixture()
+            reference_adapter = f"cat_oracle_grid_{grid_index}"
+            self.model.add_weighted_adapter(
+                ["cnn", "fox"],
+                [lambda_value, 1.0 - lambda_value],
+                reference_adapter,
+                combination_type="cat",
+            )
+
+            blend.set_lambda(self.model, lambda_value, self.base_scaling)
+            self._assert_live_formula_and_scales(lambda_value)
+            for layer in self.layers:
+                expected_delta = (
+                    lambda_value * self.pristine_deltas["cnn"][layer]
+                    + (1.0 - lambda_value) * self.pristine_deltas["fox"][layer]
+                )
+                self.assertTrue(torch.allclose(layer.get_delta_weight(reference_adapter), expected_delta, atol=1e-5))
+
+    def test_thousand_random_changes_rebase_scales_without_drift(self):
+        random_lambdas = random.Random(20260906)
+        for _ in range(1_000):
+            lambda_value = random_lambdas.uniform(-0.5, 1.5)
+            blend.set_lambda(self.model, lambda_value, self.base_scaling)
+            self._assert_live_formula_and_scales(lambda_value)
+
+        for lambda_value in (0.0, 1.0):
+            blend.set_lambda(self.model, lambda_value, self.base_scaling)
+            self._assert_live_formula_and_scales(lambda_value)
 
 
 class SerializedGenerationTests(unittest.IsolatedAsyncioTestCase):
